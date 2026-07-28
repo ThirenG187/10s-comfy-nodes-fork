@@ -1,0 +1,17 @@
+Test 1 — 2 people:
+Subject 1 = references/ref_1_man_a.jpg
+Subject 2 = references/ref_2_woman_a.jpg
+Target    = targets/target_2people.jpg
+
+Test 2 — 3 people:
+Subject 1 = references/ref_1_man_a.jpg
+Subject 2 = references/ref_2_woman_a.jpg
+Subject 3 = references/ref_3_man_b.jpg
+Target    = targets/target_3people.jpg
+
+Test 3 — 4 people:
+Subject 1 = references/ref_1_man_a.jpg
+Subject 2 = references/ref_2_woman_a.jpg
+Subject 3 = references/ref_3_man_b.jpg
+Subject 4 = references/ref_4_woman_b.jpg
+Target    = targets/target_4people_01.jpg
