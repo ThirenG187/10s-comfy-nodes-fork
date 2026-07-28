@@ -1,10 +1,9 @@
-"""Experimental multi-face LTX Best-Face-ID reinforcer for ComfyUI.
+"""Multi-face LTX identity reinforcer with BFS-style reference injection.
 
-This is a namespaced fork of TenStrip's LTXFaceIdentityReinforcer. It retains
-reference_image_2 as an alternate view of Subject 1 and adds independent
-reference pairs for Subjects 2-4. Each subject is encoded separately, assigned
-to a detected target face, spatially gated, and given an independent RoPE
-source phase range.
+The node keeps TenStrip's target-face assignment/alignment workflow while using
+BFS's exact reference-token path: reference blocks are appended after target
+video tokens, receive overlap/ST-DRC/strata coordinates, source-phase RoPE tags,
+optional clean timesteps, and are removed before rendering.
 """
 from __future__ import annotations
 
@@ -30,7 +29,7 @@ class _SubjectInput:
 
 def _debug(message: str, enabled: bool) -> None:
     if enabled:
-        print(f"[QrusheRFork Reinforcer] {message}")
+        print(f"[QrusheRFork Reinforcer] {message}", flush=True)
 
 
 def _image_to_numpy(image: torch.Tensor):
@@ -45,7 +44,15 @@ def _latent_tensor(value: Any) -> torch.Tensor:
     return value
 
 
-def _target_dimensions(target_latent: Any, vae_scale: int = 32) -> tuple[int, int, tuple[int, int, int, int, int]]:
+def _vae_spatial_scale(vae) -> tuple[int, int]:
+    try:
+        formula = vae.downscale_index_formula
+        return int(formula[2]), int(formula[1])  # height, width
+    except Exception:
+        return 32, 32
+
+
+def _target_dimensions(target_latent: Any, vae) -> tuple[int, int, tuple[int, int, int, int, int]]:
     latent = _latent_tensor(target_latent)
     if latent.dim() == 5:
         batch, channels, frames, height, width = latent.shape
@@ -54,12 +61,14 @@ def _target_dimensions(target_latent: Any, vae_scale: int = 32) -> tuple[int, in
         frames = 1
     else:
         raise ValueError(f"Expected target latent with 4 or 5 dimensions, got {tuple(latent.shape)}")
-    return height * vae_scale, width * vae_scale, (batch, channels, frames, height, width)
+    height_scale, width_scale = _vae_spatial_scale(vae)
+    return height * height_scale, width * width_scale, (batch, channels, frames, height, width)
 
 
 def _resize_bhwc(image: torch.Tensor, height: int, width: int) -> torch.Tensor:
     if image.dim() != 4:
         raise ValueError(f"Expected IMAGE [B,H,W,C], got {tuple(image.shape)}")
+    image = image[:, :, :, :3]
     if image.shape[1:3] == (height, width):
         return image.clamp(0.0, 1.0)
     value = image.permute(0, 3, 1, 2).contiguous()
@@ -119,7 +128,7 @@ def _align_face_to_target(
     target_width: int,
 ) -> torch.Tensor:
     """Uniformly scale and place a source face at a target face box."""
-    batch, source_height, source_width, channels = image.shape
+    _, source_height, source_width, _ = image.shape
     sx1, sy1, sx2, sy2 = source_bbox
     tx1, ty1, tx2, ty2 = target_bbox
     source_face_w = max(1.0, (sx2 - sx1) * source_width)
@@ -139,8 +148,6 @@ def _align_face_to_target(
     origin_x = int(round(target_center_x - source_center_x))
     origin_y = int(round(target_center_y - source_center_y))
 
-    # Start from a resized full image so uncovered regions remain meaningful,
-    # then paste the correctly aligned source over it.
     canvas = _resize_bhwc(image, target_height, target_width).clone()
     src_x1, src_y1 = max(0, -origin_x), max(0, -origin_y)
     dst_x1, dst_y1 = max(0, origin_x), max(0, origin_y)
@@ -202,9 +209,8 @@ def _extract_vae_latent(encoded: Any) -> torch.Tensor:
     return encoded
 
 
-def _encode_reference(vae, image: torch.Tensor, strength: float) -> torch.Tensor:
-    encoded = _extract_vae_latent(vae.encode(image))
-    return encoded * float(strength)
+def _encode_reference(vae, image: torch.Tensor) -> torch.Tensor:
+    return _extract_vae_latent(vae.encode(image))
 
 
 def _resolve_assignments(
@@ -219,13 +225,49 @@ def _resolve_assignments(
         index = subject.face_index if assignment_mode == "manual" else position
         if index < 0 or index >= len(ordered):
             raise ValueError(
-                f"Subject {subject.index} requests target face index {index}, but only {len(ordered)} face(s) were detected."
+                f"Subject {subject.index} requests target face index {index}, "
+                f"but only {len(ordered)} face(s) were detected."
             )
         if index in used:
             raise ValueError(f"Target face index {index} is assigned to more than one subject.")
         used.add(index)
         assignments[subject.index] = ordered[index]
     return assignments
+
+
+def _configure_reference_cfg(model, transformer_options: dict[str, Any], scale: float) -> None:
+    if float(scale) == 1.0:
+        return
+    import comfy.samplers
+
+    no_reference_options = dict(transformer_options)
+    no_reference_options.pop("qrf_bfs_reference_specs", None)
+    reference_scale = float(scale)
+
+    def _reference_cfg_function(args):
+        conditioned = args["cond"]
+        unconditioned = args["uncond"]
+        cfg_scale = args["cond_scale"]
+        denoised = unconditioned + (conditioned - unconditioned) * cfg_scale
+
+        no_reference_model_options = dict(args["model_options"])
+        no_reference_model_options["transformer_options"] = no_reference_options
+        (no_reference_prediction,) = comfy.samplers.calc_cond_batch(
+            args["model"],
+            [args["input_cond"]],
+            args["input"],
+            args["timestep"],
+            no_reference_model_options,
+        )
+        no_reference_denoised = args["input"] - no_reference_prediction
+        return denoised + (reference_scale - 1.0) * (
+            conditioned - no_reference_denoised
+        )
+
+    model.set_model_sampler_cfg_function(
+        _reference_cfg_function,
+        disable_cfg1_optimization=True,
+    )
 
 
 class LTXFaceIdentityReinforcer_QrusheRFork:
@@ -242,15 +284,13 @@ class LTXFaceIdentityReinforcer_QrusheRFork:
             },
             "optional": {
                 "target_image": ("IMAGE", {
-                    "tooltip": "The i2v first frame/composition image containing all target faces. Required for 2+ subjects."
+                    "tooltip": "Group/composition guide containing the target faces. Required for 2+ subjects. In T2V it can optionally be injected as a BFS reference block."
                 }),
                 "reference_image_2": ("IMAGE", {
                     "tooltip": "Optional alternate/cropped view of Subject 1 (same person)."
                 }),
                 "subject_2_reference_image": ("IMAGE",),
-                "subject_2_reference_image_2": ("IMAGE", {
-                    "tooltip": "Optional alternate view of Subject 2."
-                }),
+                "subject_2_reference_image_2": ("IMAGE",),
                 "subject_3_reference_image": ("IMAGE",),
                 "subject_3_reference_image_2": ("IMAGE",),
                 "subject_4_reference_image": ("IMAGE",),
@@ -268,12 +308,19 @@ class LTXFaceIdentityReinforcer_QrusheRFork:
                 "auto_face_crop": ("BOOLEAN", {"default": True}),
                 "crop_zoom_factor": ("FLOAT", {"default": 2.0, "min": 1.2, "max": 4.0, "step": 0.1}),
                 "spatial_gating": (["mask_soft", "mask_hard", "off"], {"default": "mask_soft"}),
-                "placement_mode": (["i2v_safe", "t2v_overlap", "prefix"], {"default": "i2v_safe"}),
+                "reference_layout": (["overlap", "st_drc", "strata"], {"default": "overlap"}),
+                "target_image_mode": (["assignment_only", "assignment_and_bfs_reference"], {"default": "assignment_only"}),
+                "target_guide_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "source_id_base": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 16.0, "step": 1.0}),
                 "source_id_stride": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 8.0, "step": 0.1}),
-                "phase_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
+                "phase_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.1}),
                 "background_reference_strength": ("FLOAT", {"default": 0.02, "min": 0.0, "max": 0.25, "step": 0.01}),
-                "zero_reference_timesteps": ("BOOLEAN", {"default": False}),
+                "zero_reference_timesteps": ("BOOLEAN", {"default": True,
+                    "tooltip": "BFS clean-reference behavior. Disable only if your checkpoint distorts with timestep 0 references."}),
+                "reference_guidance_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1,
+                    "tooltip": "BFS/ST-DRC reference-CFG. Values above 1 add an extra no-reference forward pass per step."}),
+                "placement_mode": (["i2v_safe", "t2v_overlap", "prefix"], {"default": "i2v_safe",
+                    "tooltip": "Legacy compatibility input. i2v_safe/t2v_overlap use reference_layout; prefix maps overlap to st_drc."}),
                 "debug": ("BOOLEAN", {"default": False}),
             },
         }
@@ -283,10 +330,9 @@ class LTXFaceIdentityReinforcer_QrusheRFork:
     FUNCTION = "reinforce"
     CATEGORY = "10S Nodes_QrusheRFork/Identity"
     DESCRIPTION = (
-        "Experimental multi-face fork of TenStrip's LTX Best-Face-ID reinforcer. "
-        "Assigns up to four independent identity references to faces detected in "
-        "the supplied target/first-frame image, with one RoPE source range and "
-        "spatial mask per subject."
+        "Multi-face Best-Face-ID reinforcer using BFS-style clean reference tokens, "
+        "source-phase RoPE, overlap/ST-DRC/strata layouts, optional target-image "
+        "reference injection, and optional reference-CFG."
     )
 
     def reinforce(
@@ -316,12 +362,16 @@ class LTXFaceIdentityReinforcer_QrusheRFork:
         auto_face_crop: bool = True,
         crop_zoom_factor: float = 2.0,
         spatial_gating: str = "mask_soft",
-        placement_mode: str = "i2v_safe",
+        reference_layout: str = "overlap",
+        target_image_mode: str = "assignment_only",
+        target_guide_strength: float = 0.35,
         source_id_base: float = 2.0,
         source_id_stride: float = 1.0,
         phase_scale: float = 1.0,
         background_reference_strength: float = 0.02,
-        zero_reference_timesteps: bool = False,
+        zero_reference_timesteps: bool = True,
+        reference_guidance_scale: float = 1.0,
+        placement_mode: str = "i2v_safe",
         debug: bool = False,
     ):
         subjects = [
@@ -338,17 +388,20 @@ class LTXFaceIdentityReinforcer_QrusheRFork:
             if primary is not None
         )
 
-        target_height, target_width, latent_shape = _target_dimensions(target_latent)
-        if len(subjects) > 1 and target_image is None:
+        target_height, target_width, latent_shape = _target_dimensions(target_latent, vae)
+        needs_target = len(subjects) > 1 or target_image_mode == "assignment_and_bfs_reference"
+        if needs_target and target_image is None:
             raise ValueError(
-                "target_image is required when using more than one subject. Wire the same first-frame image used by your i2v conditioning."
+                "target_image is required for multiple subjects or when target_image_mode injects it as a BFS reference."
             )
 
-        target_faces: list[BBox] = []
         assignments: dict[int, BBox] = {}
         if target_image is not None:
             target_faces = detect_all_faces(
-                _image_to_numpy(target_image), padding=face_padding, debug=debug, max_faces=16
+                _image_to_numpy(target_image),
+                padding=face_padding,
+                debug=debug,
+                max_faces=16,
             )
             if len(target_faces) < len(subjects):
                 raise ValueError(
@@ -357,10 +410,41 @@ class LTXFaceIdentityReinforcer_QrusheRFork:
             assignments = _resolve_assignments(target_faces, subjects, assignment_mode)
             _debug(f"target assignments: {assignments}", debug)
 
-        reference_subjects: list[dict[str, Any]] = []
+        effective_layout = reference_layout
+        if placement_mode == "prefix" and reference_layout == "overlap":
+            effective_layout = "st_drc"
+
+        reference_specs: list[dict[str, Any]] = []
+        source_cursor = 0
+        strata_cursor = 0
+
+        if target_image_mode == "assignment_and_bfs_reference":
+            prepared_target = _resize_bhwc(target_image, target_height, target_width)
+            target_reference_latent = _encode_reference(vae, prepared_target)
+            target_source_id = float(source_id_base + source_cursor * source_id_stride)
+            reference_specs.append({
+                "role": "target_guide",
+                "latent": target_reference_latent,
+                "source_id": target_source_id,
+                "phase_scale": float(phase_scale),
+                "layout": effective_layout,
+                "strata_slot": strata_cursor,
+                "token_strength": float(target_guide_strength),
+                "background_floor": 0.0,
+                "spatial_mask": None,
+            })
+            source_cursor += 1
+            strata_cursor += 1
+            _debug(
+                f"target guide: latent={tuple(target_reference_latent.shape)}, source_id={target_source_id}, strength={target_guide_strength}",
+                debug,
+            )
+
         for subject in subjects:
             primary_bbox = detect_largest_face(
-                _image_to_numpy(subject.primary), padding=face_padding, debug=debug
+                _image_to_numpy(subject.primary),
+                padding=face_padding,
+                debug=debug,
             )
             if primary_bbox is None and auto_face_crop:
                 raise ValueError(f"No face was detected in Subject {subject.index}'s primary reference.")
@@ -368,59 +452,89 @@ class LTXFaceIdentityReinforcer_QrusheRFork:
 
             if target_bbox is not None and primary_bbox is not None:
                 prepared_primary = _align_face_to_target(
-                    subject.primary, primary_bbox, target_bbox, target_height, target_width
+                    subject.primary,
+                    primary_bbox,
+                    target_bbox,
+                    target_height,
+                    target_width,
                 )
             elif auto_face_crop and primary_bbox is not None:
                 prepared_primary, target_bbox = _auto_face_crop(
-                    subject.primary, primary_bbox, target_height, target_width, crop_zoom_factor
+                    subject.primary,
+                    primary_bbox,
+                    target_height,
+                    target_width,
+                    crop_zoom_factor,
                 )
             else:
                 prepared_primary = _resize_bhwc(subject.primary, target_height, target_width)
 
-            latent_parts = [_encode_reference(vae, prepared_primary, subject.strength)]
+            latent_parts = [_encode_reference(vae, prepared_primary)]
             if subject.secondary is not None:
                 secondary_bbox = detect_largest_face(
-                    _image_to_numpy(subject.secondary), padding=face_padding, debug=debug
+                    _image_to_numpy(subject.secondary),
+                    padding=face_padding,
+                    debug=debug,
                 )
                 if target_bbox is not None and secondary_bbox is not None:
                     prepared_secondary = _align_face_to_target(
-                        subject.secondary, secondary_bbox, target_bbox, target_height, target_width
+                        subject.secondary,
+                        secondary_bbox,
+                        target_bbox,
+                        target_height,
+                        target_width,
                     )
                 elif auto_face_crop and secondary_bbox is not None:
                     prepared_secondary, _ = _auto_face_crop(
-                        subject.secondary, secondary_bbox, target_height, target_width, crop_zoom_factor
+                        subject.secondary,
+                        secondary_bbox,
+                        target_height,
+                        target_width,
+                        crop_zoom_factor,
                     )
                 else:
                     prepared_secondary = _resize_bhwc(subject.secondary, target_height, target_width)
-                latent_parts.append(_encode_reference(vae, prepared_secondary, subject.strength))
+                latent_parts.append(_encode_reference(vae, prepared_secondary))
 
             subject_latent = torch.cat(latent_parts, dim=2) if len(latent_parts) > 1 else latent_parts[0]
             mask = _make_face_mask(target_bbox, latent_shape, spatial_gating, face_padding)
-            source_id = float(source_id_base + (subject.index - 1) * source_id_stride)
-            reference_subjects.append({
+            source_id = float(source_id_base + source_cursor * source_id_stride)
+            reference_specs.append({
+                "role": f"subject_{subject.index}",
                 "subject_index": subject.index,
                 "latent": subject_latent,
                 "source_id": source_id,
                 "phase_scale": float(phase_scale),
+                "layout": effective_layout,
+                "strata_slot": strata_cursor,
                 "spatial_mask": mask,
                 "background_floor": float(background_reference_strength),
+                "token_strength": float(subject.strength),
             })
+            source_cursor += 1
+            strata_cursor += 1
             _debug(
-                f"subject {subject.index}: latent={tuple(subject_latent.shape)}, "
-                f"source_id={source_id}, target_bbox={target_bbox}, strength={subject.strength}",
+                f"subject {subject.index}: latent={tuple(subject_latent.shape)}, source_id={source_id}, "
+                f"target_bbox={target_bbox}, strength={subject.strength}",
                 debug,
             )
 
         cloned = model.clone()
         install_on_model(
             cloned,
-            zero_reference_timesteps=zero_reference_timesteps,
+            clean_reference_timesteps=zero_reference_timesteps,
             verbose=debug,
         )
-        transformer_options = cloned.model_options.setdefault("transformer_options", {})
-        transformer_options["qrf_reference_subjects"] = reference_subjects
-        transformer_options["qrf_reference_position_mode"] = (
-            "prefix" if placement_mode == "prefix" else "overlap"
+        cloned.model_options = dict(getattr(cloned, "model_options", {}) or {})
+        transformer_options = dict(cloned.model_options.get("transformer_options", {}) or {})
+        transformer_options["qrf_bfs_reference_specs"] = reference_specs
+        cloned.model_options["transformer_options"] = transformer_options
+        _configure_reference_cfg(cloned, transformer_options, reference_guidance_scale)
+
+        _debug(
+            f"configured {len(reference_specs)} BFS reference block(s), layout={effective_layout}, "
+            f"clean_timesteps={zero_reference_timesteps}, ref_cfg={reference_guidance_scale}",
+            debug,
         )
         return (cloned,)
 
@@ -430,5 +544,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LTXFaceIdentityReinforcer_QrusheRFork": "🧑‍🤝‍🧑 LTX Multi-Face Identity Reinforcer _QrusheRFork",
+    "LTXFaceIdentityReinforcer_QrusheRFork": "🧑‍🤝‍🧑 LTX Multi-Face Identity Reinforcer BFS Hybrid _QrusheRFork",
 }

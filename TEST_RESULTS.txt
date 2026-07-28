@@ -1,11 +1,14 @@
-QrusheRFork validation
-======================
+QrusheRFork BFS Hybrid validation
+================================
 
-- All Python modules compiled with py_compile: PASS
-- Package import and node registration: PASS
-- Independent RoPE source-phase range test: PASS
-- Face ordering test (left-to-right/largest-first): PASS
-- Two-subject node smoke test with fake VAE/model: PASS
+Passed:
+- Python compilation for all package modules.
+- Legacy cosine/sine source-phase range isolation.
+- Current fused 2x2 RoPE matrix source-phase isolation.
+- overlap, st_drc, and strata coordinate-layout unit tests.
+- Left-to-right and largest-first target-face ordering tests.
+- Package import and node registration smoke test.
 
-Not performed: a full LTX2/ComfyUI generation, because the build environment
-does not contain a runnable ComfyUI LTX2 model stack or checkpoint.
+Not performed:
+- Full LTX2/LTX-AV denoising generation in ComfyUI.
+- VRAM/performance benchmark for reference_guidance_scale > 1.

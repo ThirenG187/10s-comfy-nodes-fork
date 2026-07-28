@@ -1,13 +1,19 @@
-Two-subject example
-===================
+T2V — BFS guided multi-face
+===========================
 
-MODEL -> Best-Face-ID LoRA -> LTX Multi-Face Identity Reinforcer _QrusheRFork -> sampler
-VAE -------------------------------------------------------------^
-Subject 1 reference ---------------------------------------------^
-Subject 1 optional alternate reference --------------------------^
-Subject 2 reference ---------------------------------------------^
-First-frame/composition image -> target_image -------------------^
-Sampling latent ----------------> target_latent ------------------^
+Empty LTX Latent ------------------------------> target_latent
+Group/composition image -----------------------> target_image
+Subject 1 portrait ----------------------------> reference_image
+Subject 2 portrait ----------------------------> subject_2_reference_image
+Loaded LTX model + compatible identity LoRA ---> model
+LTX VAE ---------------------------------------> vae
 
-Use assignment_mode=left_to_right for the initial test.
-reference_image_2 remains an alternate image of Subject 1.
+Settings:
+  target_image_mode = assignment_and_bfs_reference
+  assignment_mode = left_to_right
+  reference_layout = overlap
+  target_guide_strength = 0.35
+  zero_reference_timesteps = true
+  reference_guidance_scale = 1.0
+
+The node's MODEL output goes to the sampler.
